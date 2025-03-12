@@ -45,6 +45,17 @@ if TYPE_CHECKING:
         WriteBuffer,
     )
 
+def _fix_datetime_precision(df):
+    """
+    For each column with dtype datetime64[ms], floor the datetime values to the nearest second,
+    and then cast the column to datetime64[s].
+    """
+    for col in df.select_dtypes(include=["datetime64[ms]"]).columns:
+        # Floor the values to the nearest second and cast to datetime64[s]
+        df[col] = pd.to_datetime(df[col]).dt.floor('s').astype("datetime64[s]")
+    return df
+
+
 
 def get_engine(engine: str) -> BaseImpl:
     """return our implementation"""
@@ -168,72 +179,6 @@ class PyArrowImpl(BaseImpl):
 
         self.api = pyarrow
 
-    def write(
-        self,
-        df: DataFrame,
-        path: FilePath | WriteBuffer[bytes],
-        compression: str | None = "snappy",
-        index: bool | None = None,
-        storage_options: StorageOptions | None = None,
-        partition_cols: list[str] | None = None,
-        filesystem=None,
-        **kwargs,
-    ) -> None:
-        self.validate_dataframe(df)
-
-        from_pandas_kwargs: dict[str, Any] = {"schema": kwargs.pop("schema", None)}
-        if index is not None:
-            from_pandas_kwargs["preserve_index"] = index
-
-        table = self.api.Table.from_pandas(df, **from_pandas_kwargs)
-
-        if df.attrs:
-            df_metadata = {"PANDAS_ATTRS": json.dumps(df.attrs)}
-            existing_metadata = table.schema.metadata
-            merged_metadata = {**existing_metadata, **df_metadata}
-            table = table.replace_schema_metadata(merged_metadata)
-
-        path_or_handle, handles, filesystem = _get_path_or_handle(
-            path,
-            filesystem,
-            storage_options=storage_options,
-            mode="wb",
-            is_dir=partition_cols is not None,
-        )
-        if (
-            isinstance(path_or_handle, io.BufferedWriter)
-            and hasattr(path_or_handle, "name")
-            and isinstance(path_or_handle.name, (str, bytes))
-        ):
-            if isinstance(path_or_handle.name, bytes):
-                path_or_handle = path_or_handle.name.decode()
-            else:
-                path_or_handle = path_or_handle.name
-
-        try:
-            if partition_cols is not None:
-                # writes to multiple files under the given path
-                self.api.parquet.write_to_dataset(
-                    table,
-                    path_or_handle,
-                    compression=compression,
-                    partition_cols=partition_cols,
-                    filesystem=filesystem,
-                    **kwargs,
-                )
-            else:
-                # write to single output file
-                self.api.parquet.write_table(
-                    table,
-                    path_or_handle,
-                    compression=compression,
-                    filesystem=filesystem,
-                    **kwargs,
-                )
-        finally:
-            if handles is not None:
-                handles.close()
-
     def read(
         self,
         path,
@@ -272,7 +217,8 @@ class PyArrowImpl(BaseImpl):
                     dtype_backend=dtype_backend,
                     to_pandas_kwargs=to_pandas_kwargs,
                 )
-
+                # Apply the patch: convert each datetime value to second precision
+                result = _fix_datetime_precision(result)
             if pa_table.schema.metadata:
                 if b"PANDAS_ATTRS" in pa_table.schema.metadata:
                     df_metadata = pa_table.schema.metadata[b"PANDAS_ATTRS"]
